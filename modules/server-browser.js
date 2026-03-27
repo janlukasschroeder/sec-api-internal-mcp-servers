@@ -5,6 +5,7 @@ const { randomUUID } = require('node:crypto');
 const express = require('express');
 const { z } = require('zod');
 const { ScrapingBeeClient } = require('scrapingbee');
+const { htmlToText } = require('./html-to-ascii');
 
 const PORT = process.env.PORT || 22_001;
 
@@ -73,20 +74,27 @@ function buildMcpServer() {
       log(`Fetching website: ${websiteUrl}`);
 
       const content = await getWebsiteContent(websiteUrl);
+      const htmlText = htmlToText(content);
 
       const urlEncoded = websiteUrl.replace(/[^a-z0-9]/gi, '_').toLowerCase();
       const timestamp = Date.now();
-      const filename = `website-content-${urlEncoded}-${timestamp}.html`;
-      fs.writeFileSync(`./output/${filename}`, content);
+      const todayDate = new Date().toISOString().split('T')[0];
+      const filenameHtml = `website-content-${urlEncoded}-${timestamp}.html`;
+      const filenameText = `website-content-${urlEncoded}-${timestamp}.txt`;
+
+      fs.mkdirSync(`./output/cache/${todayDate}`, { recursive: true });
+      fs.writeFileSync(`./output/cache/${todayDate}/${filenameHtml}`, content);
+      fs.writeFileSync(`./output/cache/${todayDate}/${filenameText}`, htmlText);
 
       return {
         content: [
           {
             type: 'text',
-            text: content,
+            // text: content,
+            text: htmlText,
           },
         ],
-        structuredContent: { content },
+        structuredContent: { content: htmlText },
       };
     }
   );

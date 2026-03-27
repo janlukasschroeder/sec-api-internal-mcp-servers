@@ -389,7 +389,7 @@ function htmlToText(html) {
   return cleanUp(raw);
 }
 
-module.exports = htmlToText;
+// module.exports = htmlToText;
 module.exports.htmlToText = htmlToText;
 module.exports.tokenize = tokenize;
 module.exports.buildTree = buildTree;
