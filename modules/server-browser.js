@@ -4,6 +4,7 @@ const fs = require('fs');
 const { randomUUID } = require('node:crypto');
 const express = require('express');
 const { z } = require('zod');
+const axios = require('axios');
 const { ScrapingBeeClient } = require('scrapingbee');
 const { htmlToText } = require('./html-to-ascii');
 
@@ -35,6 +36,15 @@ async function init() {
 // -----------------------------
 
 async function getWebsiteContent(url) {
+  // check if url ends with .json. if yes, use axios get
+  if (url.endsWith('.json')) {
+    const response = await axios.get(url);
+    return {
+      data: response.data,
+      contentType: 'application/json',
+    };
+  }
+
   const client = new ScrapingBeeClient(config.scrapingbee.apiKey);
 
   const response = await client.get({
@@ -48,7 +58,10 @@ async function getWebsiteContent(url) {
   const text = decoder.decode(response.data);
   // console.log(text);
 
-  return text;
+  return {
+    data: text,
+    contentType: response.headers['content-type'],
+  };
 }
 
 // -----------------------------
@@ -73,8 +86,15 @@ function buildMcpServer() {
     async ({ websiteUrl }) => {
       log(`Fetching website: ${websiteUrl}`);
 
-      const content = await getWebsiteContent(websiteUrl);
-      const htmlText = htmlToText(content);
+      const response = await getWebsiteContent(websiteUrl);
+      const dataOriginal = response.data;
+      let data = '';
+      // const htmlText = htmlToText(responseData);
+      if (response.contentType === 'application/json') {
+        data = JSON.stringify(dataOriginal, null, 2);
+      } else {
+        data = htmlToText(dataOriginal);
+      }
 
       const urlEncoded = websiteUrl.replace(/[^a-z0-9]/gi, '_').toLowerCase();
       const timestamp = Date.now();
@@ -83,18 +103,21 @@ function buildMcpServer() {
       const filenameText = `website-content-${urlEncoded}-${timestamp}.txt`;
 
       fs.mkdirSync(`./output/cache/${todayDate}`, { recursive: true });
-      fs.writeFileSync(`./output/cache/${todayDate}/${filenameHtml}`, content);
-      fs.writeFileSync(`./output/cache/${todayDate}/${filenameText}`, htmlText);
+      fs.writeFileSync(
+        `./output/cache/${todayDate}/${filenameHtml}`,
+        dataOriginal
+      );
+      fs.writeFileSync(`./output/cache/${todayDate}/${filenameText}`, data);
 
       return {
         content: [
           {
             type: 'text',
             // text: content,
-            text: htmlText,
+            text: data,
           },
         ],
-        structuredContent: { content: htmlText },
+        structuredContent: { content: data },
       };
     }
   );
