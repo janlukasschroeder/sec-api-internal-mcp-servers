@@ -1,4 +1,5 @@
-const dotenv = require('dotenv'); // load variables from .env file
+// const dotenv = require('dotenv'); // load variables from .env file
+const dotenv = require('../modules/secdotenv'); // load variables from .env file
 dotenv.config({ quiet: true });
 // turn off AWS SDK maintenance mode message
 // require('aws-sdk/lib/maintenance_mode_message').suppress = true;
