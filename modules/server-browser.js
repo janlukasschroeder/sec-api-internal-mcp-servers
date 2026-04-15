@@ -205,8 +205,14 @@ const start = async () => {
       }
     }
   });
-  app.listen(Number(PORT), '127.0.0.1', () => {
-    console.log(`MCP server listening on http://127.0.0.1:${PORT}/mcp`);
+
+  // const interface = '127.0.0.1';
+  const interface = '0.0.0.0';
+
+  // app.listen(Number(PORT), interface, () => {
+  // expose server to LAN interface so that Claude docker can access it
+  app.listen(Number(PORT), interface, () => {
+    console.log(`MCP server listening on http://${interface}:${PORT}/mcp`);
   });
 };
 
