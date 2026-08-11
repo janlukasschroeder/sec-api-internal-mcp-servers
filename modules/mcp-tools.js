@@ -387,7 +387,6 @@ const getWebsiteContentWithCloak = async ({
 }) => {
   const browser = await browserFactory.getBrowser({
     useProxy,
-    useCloakBrowser: true,
     url,
   });
 

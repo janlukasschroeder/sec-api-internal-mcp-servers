@@ -1,0 +1,5 @@
+node_modules
+output
+.git
+.claude
+.DS_Store

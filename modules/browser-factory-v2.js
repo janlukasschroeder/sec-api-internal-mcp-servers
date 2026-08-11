@@ -5,7 +5,6 @@ const dns = require('node:dns');
 const net = require('net');
 const path = require('path');
 const async = require('async');
-const puppeteer = require('puppeteer');
 const { LRUCache } = require('lru-cache');
 const _ = require('lodash');
 const helpers = require('./helpers');
@@ -15,10 +14,15 @@ const { log } = console;
 
 // const RUNTIME_CACHE_DIR = '/dev/shm/webcast-transcriber-v1/';
 const RUNTIME_CACHE_DIR = '/tmp/webcast-transcriber-v1/';
-const CHROME_BINARY_PATH =
-  // '/home/js/.cache/puppeteer/chrome/linux-149.0.7827.22/chrome-linux64/chrome';
-  '/Users/jan/.cloakbrowser/chromium-145.0.7632.109.2/Chromium.app/Contents/MacOS/Chromium';
 const MAX_PAGES_PER_BROWSER = 20;
+// a dns error that says nothing about the name: the resolver itself is out of
+// reach. NXDOMAIN and ENODATA are answers and stay out of this list.
+const RESOLVER_ERROR_CODES = [
+  'ETIMEOUT',
+  'ECONNREFUSED',
+  'ESERVFAIL',
+  'EREFUSED',
+];
 // on cap-hit, the browser is retired: cache slots are cleared immediately so
 // the next getBrowser() returns a fresh browser without waiting, then the old
 // browser is closed once its in-flight pages drain — or after this timeout,
@@ -101,7 +105,6 @@ const store = {
   browserIdToBrowser: {},
   browserIdToOpeningBrowser: {}, // deferred promises
   launchers: {
-    puppeteer,
     cloakBrowser: null, // async loaded because of ESM mod only
   },
   /////////////
@@ -121,8 +124,6 @@ const store = {
 
 // for cloakbrowser
 // goToFunction = page.goto(url, { waitUntil: 'networkidle', timeout: 60_000 });
-// for puppeteer
-// goToFunction = page.goto(url, { waitUntil: 'networkidle2', timeout: 60_000 });
 const continueGoToAfterTimeout = async (goToFunction, url = '') => {
   try {
     // await goToFunction(); // DO NOT call the function. it's already been called by parent.
@@ -261,10 +262,28 @@ const getDnsEntries = async (url) => {
   // missing. Promise.all would surface that as the whole call throwing even
   // though the other lookup succeeded. the downstream `r.status`/`r.reason`
   // reads already assume allSettled shape.
-  const [v4, v6] = await Promise.allSettled([
+  let [v4, v6] = await Promise.allSettled([
     resolver.resolve4(host),
     resolver.resolve6(host),
   ]);
+
+  // docker desktop drops udp 53 to a public resolver, thus the fixed servers
+  // time out in a container. an unreachable resolver is not an answer about the
+  // name, thus ask the resolver of the environment before we give up.
+  const isResolverError = (vX) => {
+    return (
+      vX?.status === 'rejected' &&
+      RESOLVER_ERROR_CODES.includes(_.get(vX, 'reason.code'))
+    );
+  };
+
+  if (isResolverError(v4) && isResolverError(v6)) {
+    log('dns servers unreachable, using the local resolver:', host);
+    [v4, v6] = await Promise.allSettled([
+      dns.promises.resolve4(host),
+      dns.promises.resolve6(host),
+    ]);
+  }
 
   // log('v4', v4);
   // log('v6', v6);
@@ -392,6 +411,7 @@ const overrideBrowserNewPage = (browser) => {
     page.on('close', () => {
       browser._livePages--;
     });
+
     return page;
   };
 };
@@ -428,7 +448,6 @@ const getNewBrowserId = () => {
 const getBrowserArgs = ({
   egressIpFamily = 6, // 6 = IPv6 egress, 4 = IPv4 egress
   useProxy,
-  useCloakBrowser,
 }) => {
   const args = [
     // '--no-sandbox',
@@ -451,70 +470,46 @@ const getBrowserArgs = ({
     args.push('--proxy-server=' + proxyUrl);
   }
 
-  if (useCloakBrowser) {
-    const display = getNextDisplay();
-    args.push('--display=' + display);
-  }
+  // the browser runs headed on an xvfb display inside the container
+  const display = getNextDisplay();
+  args.push('--display=' + display);
 
   return args;
 };
 
-const getBrowserParams = ({ args, browserId, useProxy, useCloakBrowser }) => {
+const getBrowserParams = ({ args, browserId }) => {
   const pid = String(process.pid);
   const dirName = pid + browserId;
 
   const userDataDir = path.join(RUNTIME_CACHE_DIR, dirName);
 
-  // const args = getBrowserArgs({ useProxy, useCloakBrowser });
   if (!args) {
-    // args = getBrowserArgs({ useProxy, useCloakBrowser });
     throw new Error('No args provided');
   }
 
+  // the cloak browser must run headed, or every bot wall sees it
   const browserParams = {
-    headless: true,
+    headless: false,
+    humanize: true,
     args,
     userDataDir,
   };
 
-  if (useCloakBrowser) {
-    browserParams.headless = false;
-    browserParams.humanize = true;
-  } else {
-    browserParams.executablePath = CHROME_BINARY_PATH;
-  }
-
   return browserParams;
 };
 
-const getNewBrowser = async ({
-  args,
-  browserId,
-  useProxy,
-  useCloakBrowser,
-}) => {
-  const launcher = useCloakBrowser
-    ? // npm install cloakbrowser playwright-core
-      store.launchers.cloakBrowser
-    : store.launchers.puppeteer;
+const getNewBrowser = async ({ args, browserId }) => {
+  // npm install cloakbrowser playwright-core
+  const launcher = store.launchers.cloakBrowser;
 
-  const browserParams = getBrowserParams({
-    args,
-    browserId,
-    useProxy,
-    useCloakBrowser,
-  });
+  const browserParams = getBrowserParams({ args, browserId });
 
   let browser;
 
   await fileIo.ensureDirExists(browserParams.userDataDir);
 
   try {
-    if (useCloakBrowser) {
-      browser = await launcher.launchPersistentContext(browserParams);
-    } else {
-      browser = await launcher.launch(browserParams);
-    }
+    browser = await launcher.launchPersistentContext(browserParams);
   } catch (e) {
     await fileIo.deleteDir(browserParams.userDataDir);
     throw e;
@@ -534,20 +529,14 @@ const getNewBrowser = async ({
   // → PEL error → no self-heal until MAX pages are eventually reached
   // (which won't happen because every newPage fails).
   // below code solves this.
-  // event handler factory for browser.on('close') or browser.on('disconnected').
-  // puppeteer's 'disconnected' fires with NO arguments; playwright's 'close'
-  // fires with the BrowserContext. taking the browser as an argument to the
-  // listener therefore breaks on puppeteer (browser === undefined) — so we
-  // close over the browser reference explicitly and return a bound handler.
+  // event handler factory for browser.on('close'). playwright's 'close' fires
+  // with the BrowserContext, thus we close over the browser reference and
+  // return a bound handler.
   const onBrowserClose = (browser) => async () => {
     await closeBrowser(browser);
   };
 
-  if (useCloakBrowser) {
-    browser.on('close', onBrowserClose(browser)); // playwright BrowserContext
-  } else {
-    browser.on('disconnected', onBrowserClose(browser)); // puppeteer Browser
-  }
+  browser.on('close', onBrowserClose(browser)); // playwright BrowserContext
 
   return browser;
 };
@@ -610,7 +599,6 @@ const closeBrowser = async (browser) => {
 
 const getBrowser = async ({
   useProxy = true,
-  useCloakBrowser = false,
   egressIpFamily = 6, // 6 = IPv6 egress, 4 = IPv4 egress
   url,
 } = {}) => {
@@ -631,7 +619,7 @@ const getBrowser = async ({
     log(`egressIpFamily: ${egressIpFamily}. host: ${dnsResult.host}`);
   }
 
-  const args = getBrowserArgs({ egressIpFamily, useProxy, useCloakBrowser });
+  const args = getBrowserArgs({ egressIpFamily, useProxy });
 
   const argsHash = objToHash(args);
 
@@ -673,8 +661,6 @@ const getBrowser = async ({
     const newBrowser = await getNewBrowser({
       args,
       browserId: newBrowserId,
-      useProxy,
-      useCloakBrowser,
     });
 
     store.browserIdToBrowser[newBrowserId] = newBrowser;
@@ -737,7 +723,6 @@ const testRun = async () => {
     const browser1 = await getBrowser({
       egressIpFamily: 4,
       useProxy: true,
-      useCloakBrowser: true,
     });
 
     log('browser 1 id:', browser1._id);
@@ -761,7 +746,6 @@ const testRun = async () => {
 
     const browser2 = await getBrowser({
       useProxy: true,
-      useCloakBrowser: true,
     });
     const page2 = await browser2.newPage();
 

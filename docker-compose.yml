@@ -1,0 +1,24 @@
+services:
+  browser-mcp:
+    build: .
+    image: sec-api-browser-mcp
+    container_name: browser-mcp
+    restart: unless-stopped
+    ports:
+      - '22001:22001'
+    environment:
+      - PORT=22001
+      - DISPLAY_COUNT=10
+    volumes:
+      # code, so that a change needs no rebuild. node_modules stays in the image.
+      - ./modules:/app/modules:ro
+      - ./config:/app/config:ro
+      - ./.env:/app/.env:ro
+      # the key that secdotenv needs to decrypt .env
+      - ~/.secdotenv:/root/.secdotenv:ro
+      - ./output:/app/output
+    # chromium needs more than the 64 mb default, or a tab dies on a big page
+    shm_size: '1gb'
+    # lets chromium open its own sandbox namespaces
+    security_opt:
+      - seccomp:unconfined
