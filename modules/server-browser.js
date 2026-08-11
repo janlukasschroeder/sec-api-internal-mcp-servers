@@ -1,126 +1,43 @@
 // see https://github.com/modelcontextprotocol/typescript-sdk/blob/v1.x/src/examples/server/simpleStreamableHttp.ts
-const config = require('../config');
-const fs = require('fs');
+require('../config');
 const { randomUUID } = require('node:crypto');
 const express = require('express');
-const { z } = require('zod');
-const axios = require('axios');
-const { ScrapingBeeClient } = require('scrapingbee');
-const { htmlToText } = require('./html-to-ascii');
+const mcpTools = require('./mcp-tools');
 
 const PORT = process.env.PORT || 22_001;
 
 const { log } = console;
 
-let McpServer, StreamableHTTPServerTransport, createMcpExpressApp;
+const store = {
+  McpServer: null,
+  StreamableHTTPServerTransport: null,
+  createMcpExpressApp: null,
+};
 
 async function init() {
   // CommonJS version of:
   // import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
   const mcpJs = await import('@modelcontextprotocol/sdk/server/mcp.js');
-  McpServer = mcpJs.McpServer;
+  store.McpServer = mcpJs.McpServer;
   // CommonJS version of:
   // import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
   const streamableHttpJs =
     await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
-  StreamableHTTPServerTransport =
+  store.StreamableHTTPServerTransport =
     streamableHttpJs.StreamableHTTPServerTransport;
   // CommonJS version of:
   // import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
   const expressJs = await import('@modelcontextprotocol/sdk/server/express.js');
-  createMcpExpressApp = expressJs.createMcpExpressApp;
+  store.createMcpExpressApp = expressJs.createMcpExpressApp;
 }
-
-// -----------------------------
-// ScrapingBee
-// -----------------------------
-
-async function getWebsiteContent(url) {
-  // check if url ends with .json. if yes, use axios get
-  if (url.endsWith('.json')) {
-    const response = await axios.get(url);
-    return {
-      data: response.data,
-      contentType: 'application/json',
-    };
-  }
-
-  const client = new ScrapingBeeClient(config.scrapingbee.apiKey);
-
-  const response = await client.get({
-    url: url,
-    params: {
-      render_js: true,
-    },
-  });
-
-  const decoder = new TextDecoder();
-  const text = decoder.decode(response.data);
-  // console.log(text);
-
-  return {
-    data: text,
-    contentType: response.headers['content-type'],
-  };
-}
-
-// -----------------------------
-// MCP server
-// -----------------------------
 
 function buildMcpServer() {
-  const server = new McpServer({
+  const server = new store.McpServer({
     name: 'browser-mcp',
     version: '1.0.0',
   });
 
-  server.registerTool(
-    'fetch-website',
-    {
-      title: 'Fetch Website',
-      description: 'Fetch a website and return its content.',
-      inputSchema: z.object({
-        websiteUrl: z.string().url(),
-      }),
-    },
-    async ({ websiteUrl }) => {
-      log(`Fetching website: ${websiteUrl}`);
-
-      const response = await getWebsiteContent(websiteUrl);
-      const dataOriginal = response.data;
-      let data = '';
-      // const htmlText = htmlToText(responseData);
-      if (response.contentType === 'application/json') {
-        data = JSON.stringify(dataOriginal, null, 2);
-      } else {
-        data = htmlToText(dataOriginal);
-      }
-
-      const urlEncoded = websiteUrl.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-      const timestamp = Date.now();
-      const todayDate = new Date().toISOString().split('T')[0];
-      const filenameHtml = `website-content-${urlEncoded}-${timestamp}.html`;
-      const filenameText = `website-content-${urlEncoded}-${timestamp}.txt`;
-
-      fs.mkdirSync(`./output/cache/${todayDate}`, { recursive: true });
-      fs.writeFileSync(
-        `./output/cache/${todayDate}/${filenameHtml}`,
-        dataOriginal
-      );
-      fs.writeFileSync(`./output/cache/${todayDate}/${filenameText}`, data);
-
-      return {
-        content: [
-          {
-            type: 'text',
-            // text: content,
-            text: data,
-          },
-        ],
-        structuredContent: { content: data },
-      };
-    }
-  );
+  mcpTools.registerTools(server);
 
   return server;
 }
@@ -183,7 +100,7 @@ const start = async () => {
 
     try {
       const mcpServer = buildMcpServer();
-      const mcpTransport = new StreamableHTTPServerTransport({
+      const mcpTransport = new store.StreamableHTTPServerTransport({
         // sessionIdGenerator: () => randomUUID(),
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
@@ -224,16 +141,3 @@ init().then(() => {
     process.exit(1);
   });
 });
-
-const testRun = async () => {
-  const url = 'https://www.congress.gov/bill/111th-congress/house-bill/4173';
-
-  const content = await getWebsiteContent(url);
-
-  log('Website content:', content);
-
-  // write to ./output/website-content.txt
-  fs.writeFileSync('./output/website-content.txt', content);
-};
-
-// testRun();

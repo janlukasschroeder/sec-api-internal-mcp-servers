@@ -11,9 +11,18 @@
   "description": "",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0",
+    "async": "^3.2.6",
+    "cloakbrowser": "^0.5.6",
+    "csv-parse": "^6.1.0",
+    "csv-stringify": "^6.6.0",
     "dotenv": "^16.6.1",
     "express": "^5.2.1",
+    "lodash": "^4.18.1",
+    "lru-cache": "^11.5.2",
+    "playwright-core": "^1.62.1",
+    "safe-stable-stringify": "^2.5.0",
     "scrapingbee": "^1.7.6",
+    "uuid": "^14.0.1",
     "zod": "^4.3.6"
   }
 }
