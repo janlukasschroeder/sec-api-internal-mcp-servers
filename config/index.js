@@ -24,4 +24,8 @@ module.exports = {
   scrapingbee: {
     apiKey: process.env.SCRAPINGBEE_API_KEY,
   },
+  mcp: {
+    // the http endpoint of the server in docker, used by the stdio worker
+    httpUrl: process.env.MCP_HTTP_URL || 'http://127.0.0.1:22001/mcp',
+  },
 };

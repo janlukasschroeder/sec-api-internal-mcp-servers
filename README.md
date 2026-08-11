@@ -58,7 +58,7 @@ useProxy: true  → the proxy pool
 
 ## Run on the host
 
-Two entry points, both with the same tools:
+Three entry points, all with the same tools:
 
 ```bash
 # http, for Claude Code
@@ -66,6 +66,9 @@ node modules/server-browser.js
 
 # stdio, for an app that spawns the server as a local process
 node modules/server-browser-stdio.js
+
+# stdio in, http out: a bridge to the server in docker, for Claude Desktop
+node worker/mcp-stdio-to-http.js
 ```
 
 On macOS the browser window comes up on your desktop and takes the focus. macOS
@@ -111,36 +114,48 @@ open -e "$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 ```
 
 An HTTP entry does not work either. A `type: http` url in this file gives no
-server in the app, thus the config takes a local process only. Let the app start
-the stdio server inside the running container:
+server in the app, thus the config takes a local process only.
 
-```json
-"mcpServers": {
-  "browser-mcp": {
-    "command": "/usr/local/bin/docker",
-    "args": ["exec", "-i", "browser-mcp", "node", "modules/server-browser-stdio.js"]
-  }
-}
-```
-
-Use the absolute path of `docker`, because the app does not load your shell
-profile.
-
-The container must run for this. To spawn the server on the host instead, use
-the full path of your node binary, because the app does not load your shell
-profile:
+Use `worker/mcp-stdio-to-http.js`. The app spawns that worker, and the worker
+sends each message to the HTTP server of the container:
 
 ```json
 "mcpServers": {
   "browser-mcp": {
     "command": "/Users/jan/.nvm/versions/node/v24.12.0/bin/node",
-    "args": ["/absolute/path/to/modules/server-browser-stdio.js"]
+    "args": ["/absolute/path/to/worker/mcp-stdio-to-http.js"]
   }
 }
 ```
 
-Restart the app after a change. The app spawns the server at start and never
-reloads it, thus a code change needs a restart of the app as well.
+Use the full path of your node binary, because the app does not load your shell
+profile. `MCP_HTTP_URL` points the worker at another endpoint, and the default
+is `http://127.0.0.1:22001/mcp`.
+
+The container must run for this:
+
+```bash
+docker compose up -d
+```
+
+The worker keeps the browser pool of the container warm, because every request
+lands in the same server. A code change then needs `docker compose restart`
+only, and no restart of the app.
+
+Two other ways, both without the worker:
+
+```json
+// the stdio server inside the container. one browser start per tool call.
+"command": "/usr/local/bin/docker",
+"args": ["exec", "-i", "browser-mcp", "node", "modules/server-browser-stdio.js"]
+
+// the stdio server on the host. a browser window opens on your desktop.
+"command": "/Users/jan/.nvm/versions/node/v24.12.0/bin/node",
+"args": ["/absolute/path/to/modules/server-browser-stdio.js"]
+```
+
+Restart the app after a config change. The app spawns the process at start and
+never reloads it.
 
 ## Notes
 
