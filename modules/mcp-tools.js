@@ -67,6 +67,15 @@ const RETRY_STATUS_CODES = [403, 429, 503];
 const MAX_GOTO_ATTEMPTS = 3;
 const RETRY_WAIT_MS = 1_000;
 
+// a pdf goes to the client as base64, and base64 adds a third to the size. this
+// cap keeps one answer under about 33 mb.
+const MAX_PDF_BYTES = 25 * 1024 * 1024;
+const PDF_TIMEOUT_MS = 60_000;
+// a plain http client gets a 403 from many hosts, thus send a browser agent
+const PDF_USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
+
 // a page often renders the content it held back only after the banner is gone,
 // thus wait for the network once more. best effort: a page with polling or a
 // websocket never goes idle, and then we take what rendered so far.
@@ -417,13 +426,126 @@ const getWebsiteContentWithCloak = async ({
 module.exports.getWebsiteContentWithCloak = getWebsiteContentWithCloak;
 
 // -----------------------------
+// pdf
+// -----------------------------
+
+const assertIsPdf = ({ buffer, contentType }) => {
+  if (buffer.subarray(0, 5).toString('latin1') === '%PDF-') {
+    return;
+  }
+
+  throw new Error(
+    'The response is no pdf. Content type: ' +
+      (contentType || 'unknown') +
+      '. First bytes: ' +
+      JSON.stringify(buffer.subarray(0, 20).toString('latin1'))
+  );
+};
+
+const getPdfWithHttp = async (url) => {
+  const response = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: PDF_TIMEOUT_MS,
+    maxContentLength: MAX_PDF_BYTES,
+    maxBodyLength: MAX_PDF_BYTES,
+    headers: {
+      'User-Agent': PDF_USER_AGENT,
+      Accept: 'application/pdf,*/*',
+    },
+  });
+
+  const buffer = Buffer.from(response.data);
+
+  assertIsPdf({ buffer, contentType: response.headers['content-type'] });
+
+  return {
+    buffer,
+    // axios follows a redirect, thus this can differ from the url of the request
+    finalUrl: response.request?.res?.responseUrl || url,
+  };
+};
+
+// runs in the page: the fetch goes through chromium itself, thus it carries the
+// cookies and the headers of the browser. the page must sit on the same origin,
+// or the fetch fails on cors.
+const fetchAsBase64 = async (url) => {
+  const response = await fetch(url, { credentials: 'include' });
+  const bytes = new Uint8Array(await response.arrayBuffer());
+
+  let binary = '';
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary);
+};
+
+// a navigation to a pdf gives the html of the built-in viewer and not the file,
+// thus navigate first and fetch the bytes from inside the page afterwards.
+const getPdfWithBrowser = async ({ url, useProxy }) => {
+  const browser = await browserFactory.getBrowser({ useProxy, url });
+  const page = await getCloakPage(browser);
+
+  try {
+    for (let attempt = 1; attempt <= MAX_GOTO_ATTEMPTS; attempt++) {
+      const response = await page.goto(url, {
+        waitUntil: 'load',
+        timeout: PDF_TIMEOUT_MS,
+      });
+
+      const base64 = await page.evaluate(fetchAsBase64, url);
+      const buffer = Buffer.from(base64, 'base64');
+
+      if (buffer.length > MAX_PDF_BYTES) {
+        throw new Error(
+          'The pdf is larger than the cap of ' +
+            MAX_PDF_BYTES +
+            ' bytes: ' +
+            buffer.length
+        );
+      }
+
+      if (buffer.subarray(0, 5).toString('latin1') === '%PDF-') {
+        return { buffer, finalUrl: response ? response.url() : url };
+      }
+
+      log(
+        `Attempt ${attempt}/${MAX_GOTO_ATTEMPTS}: no pdf yet, ` +
+          `${buffer.length} bytes`
+      );
+
+      if (attempt === MAX_GOTO_ATTEMPTS) {
+        assertIsPdf({
+          buffer,
+          contentType: response ? response.headers()['content-type'] : null,
+        });
+      }
+
+      await helpers.wait(RETRY_WAIT_MS);
+    }
+  } finally {
+    await page.close().catch(() => {});
+  }
+};
+
+const getPdf = async ({ url, useProxy = false }) => {
+  try {
+    return await getPdfWithHttp(url);
+  } catch (err) {
+    log('Plain download failed, using the browser:', err.message);
+    return await getPdfWithBrowser({ url, useProxy });
+  }
+};
+module.exports.getPdf = getPdf;
+
+// -----------------------------
 // cache
 // -----------------------------
 
-const writeCache = ({ url, html, text }) => {
-  // macos and linux cap a file name at 255 bytes, and a url with a long query
-  // string blows past that. cut the readable part and keep the hash of the full
-  // url, so that the name stays unique.
+// macos and linux cap a file name at 255 bytes, and a url with a long query
+// string blows past that. cut the readable part and keep the hash of the full
+// url, so that the name stays unique.
+const getCachePath = ({ url, prefix }) => {
   const urlEncoded = url
     .replace(/[^a-z0-9]/gi, '_')
     .toLowerCase()
@@ -433,17 +555,40 @@ const writeCache = ({ url, html, text }) => {
   // absolute path: on the stdio transport the parent app sets the cwd, thus a
   // relative path can point anywhere.
   const dir = CACHE_DIR + '/' + todayDate;
-  const fileName =
-    'website-content-' + urlEncoded + '-' + helpers.sha8(url) + '-' + timestamp;
 
   fs.mkdirSync(dir, { recursive: true });
+
+  return (
+    dir +
+    '/' +
+    prefix +
+    '-' +
+    urlEncoded +
+    '-' +
+    helpers.sha8(url) +
+    '-' +
+    timestamp
+  );
+};
+
+const writeCache = ({ url, html, text }) => {
+  const filePath = getCachePath({ url, prefix: 'website-content' });
+
   fs.writeFileSync(
-    dir + '/' + fileName + '.html',
+    filePath + '.html',
     typeof html === 'string' ? html : JSON.stringify(html, null, 2)
   );
   if (text) {
-    fs.writeFileSync(dir + '/' + fileName + '.txt', text);
+    fs.writeFileSync(filePath + '.txt', text);
   }
+};
+
+const writePdfCache = ({ url, buffer }) => {
+  const filePath = getCachePath({ url, prefix: 'pdf' }) + '.pdf';
+
+  fs.writeFileSync(filePath, buffer);
+
+  return filePath;
 };
 
 // -----------------------------
@@ -529,6 +674,52 @@ const getWebsiteAsTextHandler = async ({ websiteUrl, timeoutMs, useProxy }) => {
   };
 };
 
+const getPdfHandler = async ({ pdfUrl, useProxy }) => {
+  log(`Fetching pdf: ${pdfUrl}`);
+
+  const { buffer, finalUrl } = await getPdf({ url: pdfUrl, useProxy });
+  const filePath = writePdfCache({ url: pdfUrl, buffer });
+
+  log(`Fetched ${finalUrl}. Bytes: ${buffer.length}. Cache: ${filePath}`);
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text:
+          'PDF ' + finalUrl + ', ' + Math.round(buffer.length / 1024) + ' KB',
+      },
+      {
+        // the whole file, as an embedded resource. the client reads the pdf
+        // itself, thus we send the bytes and not an extract.
+        type: 'resource',
+        resource: {
+          uri: finalUrl,
+          mimeType: 'application/pdf',
+          blob: buffer.toString('base64'),
+        },
+      },
+    ],
+    structuredContent: {
+      url: finalUrl,
+      bytes: buffer.length,
+    },
+  };
+};
+
+const getPdfTool = {
+  name: 'get-pdf',
+  config: {
+    title: 'Get PDF',
+    description: `Download a PDF and return the whole file as an embedded resource with the media type application/pdf. Use this tool for a URL that points to a PDF. A plain download runs first, and the browser takes over when a bot wall blocks it. Set useProxy to true to send the request through a rotating SOCKS5 proxy pool. A file above 25 MB is refused.`,
+    inputSchema: z.object({
+      pdfUrl: z.string().url(),
+      useProxy: z.boolean().optional(),
+    }),
+  },
+  handler: getPdfHandler,
+};
+
 const fetchWebsiteTool = {
   name: 'fetch-website',
   config: {
@@ -545,7 +736,7 @@ const getWebsiteAsHtmlTool = {
   name: 'get-website-as-html',
   config: {
     title: 'Get Website As HTML',
-    description: `Fetch a website with the cloak browser, which is a stealth browser that runs JavaScript. The request goes out over the local IP. Set useProxy to true to send it through a rotating SOCKS5 proxy pool instead, e.g. when the site blocks the local IP. Returns the HTML of the page. The HTML of all iframes is part of the page HTML. Use this tool when fetch-website is blocked by bot detection, or when it returns an empty page. Use get-website-as-text if you do not need the HTML tags.`,
+    description: `Fetch a website with a browser that runs JavaScript. The request goes out over the local IP. Set useProxy to true to send it through a rotating SOCKS5 proxy pool instead, e.g. when the site blocks the local IP. Returns the HTML of the page. The HTML of all iframes is part of the page HTML. Use this tool when fetch-website is blocked by bot detection, or when it returns an empty page. Use get-website-as-text if you do not need the HTML tags.`,
     inputSchema: z.object({
       websiteUrl: z.string().url(),
       timeoutMs: z.number().int().positive().optional(),
@@ -559,7 +750,7 @@ const getWebsiteAsTextTool = {
   name: 'get-website-as-text',
   config: {
     title: 'Get Website As Text',
-    description: `Fetch a website with the cloak browser, which is a stealth browser that runs JavaScript, and return the page as plain text. The request goes out over the local IP. Set useProxy to true to send it through a rotating SOCKS5 proxy pool instead, e.g. when the site blocks the local IP. The text of all iframes is part of the page text. Tables become ASCII tables, and links keep their target URL. Use this tool to read a page. Use get-website-as-html if you need the HTML tags.`,
+    description: `Fetch a website with a browser that runs JavaScript, and return the page as plain text. The request goes out over the local IP. Set useProxy to true to send it through a rotating SOCKS5 proxy pool instead, e.g. when the site blocks the local IP. The text of all iframes is part of the page text. Tables become ASCII tables, and links keep their target URL. Use this tool to read a page. Use get-website-as-html if you need the original HTML of the page.`,
     inputSchema: z.object({
       websiteUrl: z.string().url(),
       timeoutMs: z.number().int().positive().optional(),
@@ -574,6 +765,7 @@ const tools = [
   // fetchWebsiteTool, // legacy
   getWebsiteAsHtmlTool,
   getWebsiteAsTextTool,
+  getPdfTool,
 ];
 module.exports.tools = tools;
 
@@ -584,6 +776,17 @@ const registerTools = (server) => {
   return server;
 };
 module.exports.registerTools = registerTools;
+
+// the same shape that tools/list answers, for a plain GET on the mcp route
+const getToolList = () => {
+  return tools.map((tool) => ({
+    name: tool.name,
+    title: tool.config.title,
+    description: tool.config.description,
+    inputSchema: z.toJSONSchema(tool.config.inputSchema),
+  }));
+};
+module.exports.getToolList = getToolList;
 
 //
 //

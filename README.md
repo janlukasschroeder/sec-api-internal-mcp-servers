@@ -1,7 +1,7 @@
 # SEC-API Internal MCP Servers
 
 - MCP server to fetch URLs with cloakbrowser
-- Returns HTML and html-to-text
+- Returns HTML, html-to-text and PDF files
 
 ## Tools
 
@@ -9,14 +9,24 @@
 | --------------------- | --------------------------------------------------- |
 | `get-website-as-html` | the page HTML, with the HTML of all iframes inlined |
 | `get-website-as-text` | the same page as plain text, tables as ASCII tables |
+| `get-pdf`             | the whole PDF as an embedded resource               |
 
-Both tools take:
+The two website tools take:
 
 | Input        | Default | Use                                                 |
 | ------------ | ------- | --------------------------------------------------- |
 | `websiteUrl` | —       | the page to fetch                                   |
 | `timeoutMs`  | 15000   | how long `page.goto` waits for the network to idle  |
 | `useProxy`   | `false` | `true` sends the request through the SOCKS5 proxies |
+
+`get-pdf` takes `pdfUrl` and `useProxy`. It first tries a plain download with a
+browser agent, and it falls back to the cloak browser, because some hosts, such
+as sec.gov, answer 403 to that agent. The magic number `%PDF-` decides whether
+the answer holds a file: a login page, a soft 404 and the HTML of the built-in
+PDF viewer all come with status 200.
+
+A GET on `http://127.0.0.1:22001/mcp` shows all tools as an HTML page. The MCP
+protocol runs over POST on the same route.
 
 ## Run in Docker (recommended)
 
@@ -123,7 +133,7 @@ sends each message to the HTTP server of the container:
 "mcpServers": {
   "browser-mcp": {
     "command": "/Users/jan/.nvm/versions/node/v24.12.0/bin/node",
-    "args": ["/absolute/path/to/worker/mcp-stdio-to-http.js"]
+    "args": ["/Users/jan/VSCodeProjects/sec-api/sec-api-internal-mcp-servers/worker/mcp-stdio-to-http.js"]
   }
 }
 ```
@@ -151,16 +161,34 @@ Two other ways, both without the worker:
 
 // the stdio server on the host. a browser window opens on your desktop.
 "command": "/Users/jan/.nvm/versions/node/v24.12.0/bin/node",
-"args": ["/absolute/path/to/modules/server-browser-stdio.js"]
+"args": ["/Users/jan/VSCodeProjects/sec-api/sec-api-internal-mcp-servers/modules/server-browser-stdio.js"]
 ```
 
 Restart the app after a config change. The app spawns the process at start and
 never reloads it.
 
+## Scripts
+
+They run against the server on `config.mcp.httpUrl`, thus the container must
+run. `MCP_HTTP_URL` points them at another server.
+
+```bash
+# list every tool with its inputs. exits 1 when the server offers none
+node scripts/test-mcp-tools-list.js
+
+# call get-pdf and check the header and the end marker of each file.
+# without an argument it takes two known URLs, one per download path
+node scripts/test-mcp-tool-get-pdf.js [url ...]
+
+# download one pdf to output/tmp.pdf, without the mcp server
+node scripts/get-pdf.js [url]
+```
+
 ## Notes
 
-- The page cache goes to `output/cache/<date>/`, as `.html` and as `.txt`.
-- `cloakbrowser info` reports the state of the browser and of the fonts:
+- The page cache goes to `output/cache/<date>/`, as `.html` and as `.txt`. A
+  PDF goes to the same folder, as `.pdf`.
+- `npx cloakbrowser info` reports the state of the browser and of the fonts:
   ```bash
   docker compose exec browser-mcp node node_modules/cloakbrowser/dist/cli.js info
   ```
