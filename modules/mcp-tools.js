@@ -391,7 +391,7 @@ const gotoWithRetry = async ({ page, url, timeoutMs }) => {
 const getWebsiteContentWithCloak = async ({
   url,
   timeoutMs = CLOAK_TIMEOUT_MS,
-  useProxy = false,
+  useProxy = true,
   acceptCookies = true,
 }) => {
   const browser = await browserFactory.getBrowser({
@@ -528,7 +528,7 @@ const getPdfWithBrowser = async ({ url, useProxy }) => {
   }
 };
 
-const getPdf = async ({ url, useProxy = false }) => {
+const getPdf = async ({ url, useProxy = true }) => {
   try {
     return await getPdfWithHttp(url);
   } catch (err) {
@@ -736,7 +736,7 @@ const getWebsiteAsHtmlTool = {
   name: 'get-website-as-html',
   config: {
     title: 'Get Website As HTML',
-    description: `Fetch a website with a browser that runs JavaScript. The request goes out over the local IP. Set useProxy to true to send it through a rotating SOCKS5 proxy pool instead, e.g. when the site blocks the local IP. Returns the HTML of the page. The HTML of all iframes is part of the page HTML. Use this tool when fetch-website is blocked by bot detection, or when it returns an empty page. Use get-website-as-text if you do not need the HTML tags.`,
+    description: `Fetch a website with a browser that runs JavaScript. The request goes out over a rotating pool of Proton VPN exit nodes. Set useProxy to false to send it over the local IP instead. Returns the HTML of the page. The HTML of all iframes is part of the page HTML. Use this tool when fetch-website is blocked by bot detection, or when it returns an empty page. Use get-website-as-text if you do not need the HTML tags.`,
     inputSchema: z.object({
       websiteUrl: z.string().url(),
       timeoutMs: z.number().int().positive().optional(),
@@ -750,7 +750,7 @@ const getWebsiteAsTextTool = {
   name: 'get-website-as-text',
   config: {
     title: 'Get Website As Text',
-    description: `Fetch a website with a browser that runs JavaScript, and return the page as plain text. The request goes out over the local IP. Set useProxy to true to send it through a rotating SOCKS5 proxy pool instead, e.g. when the site blocks the local IP. The text of all iframes is part of the page text. Tables become ASCII tables, and links keep their target URL. Use this tool to read a page. Use get-website-as-html if you need the original HTML of the page.`,
+    description: `Fetch a website with a browser that runs JavaScript, and return the page as plain text. The request goes out over a rotating pool of Proton VPN exit nodes. Set useProxy to false to send it over the local IP instead. The text of all iframes is part of the page text. Tables become ASCII tables, and links keep their target URL. Use this tool to read a page. Use get-website-as-html if you need the original HTML of the page.`,
     inputSchema: z.object({
       websiteUrl: z.string().url(),
       timeoutMs: z.number().int().positive().optional(),

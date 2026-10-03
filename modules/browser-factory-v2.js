@@ -1,28 +1,23 @@
 require('../config'); // needed to load DISPLAY=:99
 const fs = require('fs');
 const fsp = require('fs/promises');
-const dns = require('node:dns');
-const net = require('net');
+const os = require('os');
 const path = require('path');
 const async = require('async');
-const { LRUCache } = require('lru-cache');
-const _ = require('lodash');
 const helpers = require('./helpers');
 const fileIo = require('./file-io-v2');
+const proxyFactory = require('./proxy-factory');
 
 const { log } = console;
 
-// const RUNTIME_CACHE_DIR = '/dev/shm/webcast-transcriber-v1/';
-const RUNTIME_CACHE_DIR = '/tmp/webcast-transcriber-v1/';
+// check if we run on Mac or Linux.
+// linux: /dev/shm, a ram disk
+// mac: /tmp on disk (doesn't have in-mem tmp)
+const RUNTIME_CACHE_DIR =
+  process.platform === 'linux'
+    ? '/dev/shm/sec-api-internal-mcp-servers/'
+    : path.join(os.tmpdir(), 'sec-api-internal-mcp-servers/') + path.sep;
 const MAX_PAGES_PER_BROWSER = 20;
-// a dns error that says nothing about the name: the resolver itself is out of
-// reach. NXDOMAIN and ENODATA are answers and stay out of this list.
-const RESOLVER_ERROR_CODES = [
-  'ETIMEOUT',
-  'ECONNREFUSED',
-  'ESERVFAIL',
-  'EREFUSED',
-];
 // on cap-hit, the browser is retired: cache slots are cleared immediately so
 // the next getBrowser() returns a fresh browser without waiting, then the old
 // browser is closed once its in-flight pages drain — or after this timeout,
@@ -30,71 +25,13 @@ const RESOLVER_ERROR_CODES = [
 // and would otherwise leave the retired browser alive forever.
 const RETIREMENT_TIMEOUT_MS = 2 * 60 * 1000;
 
-// per-hostname reachability cache. avoids a socks5 handshake on every retry
-// of the same dead host. bounded LRU so a long-running worker probing many
-// unique hostnames doesn't grow the map forever. ttl expiry handled by the
-// cache itself (ttlAutopurge keeps memory tight even without access).
-const hostReachabilityCache = new LRUCache({
-  max: 500_000,
-  ttl: 5 * 60 * 1000,
-  ttlAutopurge: true,
-}); // hostname -> boolean (ok)
-
-const dnsCache = new LRUCache({
-  max: 500_000,
-  ttl: 60 * 60 * 1000, // 1 hr
-  ttlAutopurge: true,
-});
-
-const dnsResolverCache = new LRUCache({
-  max: 1,
-  ttl: 60 * 60 * 1000, // 1 hr
-  ttlAutopurge: true,
-});
-
-// chromium accepts socks5:// (and always resolves hostnames remotely for
-// socks5 anyway — see net/socket/socks5_client_socket.cc). socks5h:// is a
-// curl-only alias and triggers net::ERR_NO_SUPPORTED_PROXIES here.
-const SOCKS5_PROXIES_LOCAL_IPV6_EGRESS = [
-  'socks5://127.0.0.1:1080',
-  'socks5://127.0.0.1:1081',
-  'socks5://127.0.0.1:1082',
-  'socks5://127.0.0.1:1083',
-  'socks5://127.0.0.1:1084',
-  'socks5://127.0.0.1:1085',
-  'socks5://127.0.0.1:1086',
-  'socks5://127.0.0.1:1087',
-  'socks5://127.0.0.1:1088',
-  'socks5://127.0.0.1:1089',
-];
-
-const ATLAS_TAILSCALE_IP = '100.124.201.21';
-const ATLAS_PORT_RANGE_V6_EGRESS = '1080:1089';
-// const ATLAS_PORT_RANGE_V6_EGRESS = '1080:1081';
-const ATLAS_PORT_RANGE_V4_EGRESS = '4080:4083';
-
-const [ATLAS_PORT_START_IPV6, ATLAS_PORT_END_IPV6] =
-  ATLAS_PORT_RANGE_V6_EGRESS.split(':').map(Number);
-
-const [ATLAS_PORT_START_IPV4, ATLAS_PORT_END_IPV4] =
-  ATLAS_PORT_RANGE_V4_EGRESS.split(':').map(Number);
-
-const SOCKS5_PROXIES_ATLAS_TAILSCALE_IPV6_EGRESS = Array.from(
-  { length: ATLAS_PORT_END_IPV6 - ATLAS_PORT_START_IPV6 + 1 },
-  (_, i) => 'socks5://' + ATLAS_TAILSCALE_IP + ':' + (ATLAS_PORT_START_IPV6 + i)
-);
-const SOCKS5_PROXIES_ATLAS_TAILSCALE_IPV4_EGRESS = Array.from(
-  { length: ATLAS_PORT_END_IPV4 - ATLAS_PORT_START_IPV4 + 1 },
-  (_, i) => 'socks5://' + ATLAS_TAILSCALE_IP + ':' + (ATLAS_PORT_START_IPV4 + i)
-);
-
 // round-robin across N Xvfb virtual displays so a single Xvfb's maxclients
 // cap (chrome opens ~5-10 X connections per process) doesn't bottleneck the
 // fleet. keep in sync with ecosystem.cloakbrowser.config.js.
 // const DISPLAYS = Array.from({ length: 10 }, (_, i) => ':' + (99 + i));
 const DISPLAYS = Array.from(
-  { length: SOCKS5_PROXIES_ATLAS_TAILSCALE_IPV6_EGRESS.length },
-  (_, i) => ':' + (99 + i)
+  { length: proxyFactory.getPoolSize(6) },
+  (unused, i) => ':' + (99 + i)
 );
 // const DISPLAYS = Array.from({ length: 1 }, (_, i) => ':' + (99 + i));
 // const DISPLAYS = Array.from({ length: 2 }, (_, i) => ':' + (99 + i));
@@ -107,23 +44,13 @@ const store = {
   launchers: {
     cloakBrowser: null, // async loaded because of ESM mod only
   },
-  /////////////
-  proxySource: 'atlasTailscale',
-  proxyIndexIpV6: 0,
-  proxyIndexIpV4: 0,
-  proxiesIpV6: {
-    local: SOCKS5_PROXIES_LOCAL_IPV6_EGRESS,
-    atlasTailscale: SOCKS5_PROXIES_ATLAS_TAILSCALE_IPV6_EGRESS,
-  },
-  proxiesIpV4: {
-    local: [],
-    atlasTailscale: SOCKS5_PROXIES_ATLAS_TAILSCALE_IPV4_EGRESS,
-  },
   displayIndex: 0,
 };
 
 // for cloakbrowser
 // goToFunction = page.goto(url, { waitUntil: 'networkidle', timeout: 60_000 });
+// for puppeteer
+// goToFunction = page.goto(url, { waitUntil: 'networkidle2', timeout: 60_000 });
 const continueGoToAfterTimeout = async (goToFunction, url = '') => {
   try {
     // await goToFunction(); // DO NOT call the function. it's already been called by parent.
@@ -143,246 +70,18 @@ const continueGoToAfterTimeout = async (goToFunction, url = '') => {
 };
 module.exports.continueGoToAfterTimeout = continueGoToAfterTimeout;
 
-// cheap DNS-lookup-via-socks5: open the socks5 handshake with the target
-// host as an ATYP=3 (DOMAINNAME) CONNECT, and close immediately once the
-// server reports success. this uses the socks server's own resolver + a
-// single TCP connect through the same tunnel chrome will later use — so a
-// pass here strongly implies chrome will at least reach the host.
-const probeHostViaSocks5 = ({
-  proxyHost,
-  proxyPort,
-  hostname,
-  port = 443,
-  timeoutMs = 3500,
-}) => {
-  return new Promise((resolve) => {
-    const socket = net.connect(proxyPort, proxyHost);
-    let done = false;
-    const finish = (ok) => {
-      if (done) {
-        return;
-      }
-      done = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolve(ok);
-    };
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    socket.once('error', () => finish(false));
-    socket.once('connect', () => {
-      // greeting: ver=5, nmethods=1, method=0 (no auth)
-      socket.write(Buffer.from([5, 1, 0]));
-      socket.once('data', (greet) => {
-        if (greet[0] !== 5 || greet[1] !== 0) {
-          return finish(false);
-        }
-        // CONNECT request: ver=5, cmd=1, rsv=0, atyp=3 (domain), len, name, port
-        const nameBuf = Buffer.from(hostname, 'ascii');
-        const req = Buffer.concat([
-          Buffer.from([5, 1, 0, 3, nameBuf.length]),
-          nameBuf,
-          Buffer.from([(port >> 8) & 0xff, port & 0xff]),
-        ]);
-        socket.write(req);
-        socket.once('data', (resp) => finish(resp[0] === 5 && resp[1] === 0));
-      });
-    });
-  });
-};
-
-// in:  https://investor.cvs.com
-// out: true | false
-const isHostReachable = async (hostname) => {
-  if (hostReachabilityCache.has(hostname)) {
-    return hostReachabilityCache.get(hostname);
-  }
-
-  let ok = false;
-  try {
-    const u = new URL(getCurrentProxy());
-    ok = await probeHostViaSocks5({
-      proxyHost: u.hostname,
-      proxyPort: Number(u.port),
-      hostname,
-    });
-  } catch (err) {
-    ok = false;
-  }
-  hostReachabilityCache.set(hostname, ok);
-  return ok;
-};
-module.exports.isHostReachable = isHostReachable;
-
-// in:  https://www.intc.com/path
-// in:  www.intc.com
-// out: www.intc.com
-const urlToHost = (url) => {
-  if (!url || typeof url !== 'string') {
-    return null;
-  }
-  const withScheme = /^https?:\/\//i.test(url) ? url : 'https://' + url;
-  try {
-    return new URL(withScheme).hostname.toLowerCase();
-  } catch (err) {
-    return null;
-  }
-};
-module.exports.urlToHost = urlToHost;
-
-const getDnsResolver = () => {
-  if (dnsResolverCache.has('resolver')) {
-    return dnsResolverCache.get('resolver');
-  }
-  const resolver = new dns.promises.Resolver({ timeout: 1500, tries: 1 });
-
-  resolver.setServers(['8.8.4.4', '1.1.1.1', '8.8.8.8']);
-
-  dnsResolverCache.set('resolver', resolver);
-
-  return resolver;
-};
-
-// const getDnsEntries = async ({ host, url }) => {
-// in:  https://www.intc.com/path/1/2
-// in:  intc.com
-// out: { host, anyDnsEntryAvailable, v4, v6 }
-const getDnsEntries = async (url) => {
-  // if (!host && url) {
-  const host = urlToHost(url);
-  // }
-
-  if (dnsCache.has(host)) {
-    return dnsCache.get(host);
-  }
-
-  const resolver = getDnsResolver();
-
-  // allSettled, not all: hosts commonly have A but no AAAA (or vice versa),
-  // and resolve4/resolve6 reject with ENODATA when their record type is
-  // missing. Promise.all would surface that as the whole call throwing even
-  // though the other lookup succeeded. the downstream `r.status`/`r.reason`
-  // reads already assume allSettled shape.
-  let [v4, v6] = await Promise.allSettled([
-    resolver.resolve4(host),
-    resolver.resolve6(host),
-  ]);
-
-  // docker desktop drops udp 53 to a public resolver, thus the fixed servers
-  // time out in a container. an unreachable resolver is not an answer about the
-  // name, thus ask the resolver of the environment before we give up.
-  const isResolverError = (vX) => {
-    return (
-      vX?.status === 'rejected' &&
-      RESOLVER_ERROR_CODES.includes(_.get(vX, 'reason.code'))
-    );
-  };
-
-  if (isResolverError(v4) && isResolverError(v6)) {
-    log('dns servers unreachable, using the local resolver:', host);
-    [v4, v6] = await Promise.allSettled([
-      dns.promises.resolve4(host),
-      dns.promises.resolve6(host),
-    ]);
-  }
-
-  // log('v4', v4);
-  // log('v6', v6);
-
-  // vX = { status: 'fulfilled', value: [ '192.198.165.191' ] }
-  // vX = { status: 'rejected', reason: Error: queryAaaa ENODATA intc.com { code: 'ENODATA', syscall: 'queryAaaa' } }
-  const hasEntry = (vX) => vX?.status === 'fulfilled' && vX?.value?.length > 0;
-  const getAddresses = (vX) => (hasEntry(vX) ? vX.value : []);
-
-  const anyDnsEntryAvailable = [v4, v6].some(hasEntry);
-
-  // error codes
-  // NXDOMAIN / no-such-record = authoritative answer about the name
-  // SERVFAIL / TIMEOUT / REFUSED = your resolver, not their domain
-  const result = {
-    host,
-    anyDnsEntryAvailable,
-    v4: {
-      isResolved: hasEntry(v4),
-      addresses: getAddresses(v4),
-      errorCode: _.get(v4, 'reason.code'),
-    },
-    v6: {
-      isResolved: hasEntry(v6),
-      addresses: getAddresses(v6),
-      errorCode: _.get(v6, 'reason.code'), // eg 'ENOTFOUND', 'ENODATA'
-    },
-  };
-
-  dnsCache.set(host, result);
-
-  return result;
-};
-module.exports.getDnsEntries = getDnsEntries;
-
-// egressIpFamily: 4 | 6
-const getAllProxies = (egressIpFamily = 6) => {
-  if (egressIpFamily === 6) {
-    return store.proxiesIpV6[store.proxySource];
-  }
-  if (egressIpFamily === 4) {
-    return store.proxiesIpV4[store.proxySource];
-  }
-  throw new Error('Unknown egress IP family');
-};
-
-const getProxyIndex = (egressIpFamily) => {
-  if (egressIpFamily === 6) {
-    return store.proxyIndexIpV6;
-  }
-  if (egressIpFamily === 4) {
-    return store.proxyIndexIpV4;
-  }
-  throw new Error('Unknown egress IP family');
-};
-
-const getCurrentProxy = (
-  egressIpFamily = 6 // 6 = IPv6 egress, 4 = IPv4 egress
-) => {
-  const proxies = getAllProxies(egressIpFamily);
-  const proxyIndex = getProxyIndex(egressIpFamily);
-  return proxies[proxyIndex];
-};
-
-const incrementProxyIndex = (
-  egressIpFamily = 6 // 6 = IPv6 egress, 4 = IPv4 egress
-) => {
-  const proxies = getAllProxies(egressIpFamily);
-  const proxyIndex = getProxyIndex(egressIpFamily);
-
-  if (egressIpFamily === 6) {
-    store.proxyIndexIpV6 = (proxyIndex + 1) % proxies.length;
-  }
-  if (egressIpFamily === 4) {
-    store.proxyIndexIpV4 = (proxyIndex + 1) % proxies.length;
-  }
-};
-
-const getNextProxy = (
-  egressIpFamily = 6 // 6 = IPv6 egress, 4 = IPv4 egress
-) => {
-  const proxies = getAllProxies(egressIpFamily);
-  const proxyIndex = getProxyIndex(egressIpFamily);
-  // log(proxies, proxyIndex);
-  const proxyUrl = proxies[proxyIndex];
-  incrementProxyIndex(egressIpFamily);
-  return proxyUrl;
-};
-module.exports.getNextProxy = getNextProxy;
-module.exports.getCurrentProxy = getCurrentProxy;
-
 // round-robin across the Xvfb display pool so parallel chrome launches spread
 // across all X servers instead of saturating one server's maxclients cap.
-const getNextDisplay = () => {
-  //   const display = DISPLAYS[store.displayIndex];
-  //   store.displayIndex = (store.displayIndex + 1) % DISPLAYS.length;
-  //   return display;
-  // return DISPLAYS[store.proxyIndex % DISPLAYS.length];
-  return DISPLAYS[store.proxyIndexIpV6 % DISPLAYS.length];
+// one display per proxy slot, so that the browsers of one egress share an x
+// server. without a proxy there is no slot, thus count on.
+const getNextDisplay = (proxyIndex) => {
+  if (Number.isFinite(proxyIndex)) {
+    return DISPLAYS[proxyIndex % DISPLAYS.length];
+  }
+
+  const display = DISPLAYS[store.displayIndex % DISPLAYS.length];
+  store.displayIndex = (store.displayIndex + 1) % DISPLAYS.length;
+  return display;
 };
 
 const objToHash = (...params) => {
@@ -411,7 +110,6 @@ const overrideBrowserNewPage = (browser) => {
     page.on('close', () => {
       browser._livePages--;
     });
-
     return page;
   };
 };
@@ -465,14 +163,15 @@ const getBrowserArgs = ({
     '--disable-features=Crashpad',
   ];
 
+  let proxyIndex = null;
+
   if (useProxy) {
-    const proxyUrl = getNextProxy(egressIpFamily);
-    args.push('--proxy-server=' + proxyUrl);
+    const proxy = proxyFactory.getNextProxy(egressIpFamily);
+    proxyIndex = proxy.index;
+    args.push('--proxy-server=' + proxy.url);
   }
 
-  // the browser runs headed on an xvfb display inside the container
-  const display = getNextDisplay();
-  args.push('--display=' + display);
+  args.push('--display=' + getNextDisplay(proxyIndex));
 
   return args;
 };
@@ -529,9 +228,9 @@ const getNewBrowser = async ({ args, browserId }) => {
   // → PEL error → no self-heal until MAX pages are eventually reached
   // (which won't happen because every newPage fails).
   // below code solves this.
-  // event handler factory for browser.on('close'). playwright's 'close' fires
-  // with the BrowserContext, thus we close over the browser reference and
-  // return a bound handler.
+  // playwright's 'close' fires with the BrowserContext. taking the browser as
+  // an argument to the listener would therefore break, so we close over the
+  // browser reference explicitly and return a bound handler.
   const onBrowserClose = (browser) => async () => {
     await closeBrowser(browser);
   };
@@ -608,15 +307,11 @@ const getBrowser = async ({
   }
 
   if (url) {
-    const dnsResult = await getDnsEntries(url);
+    const egress = await proxyFactory.getEgressIpFamily(url);
 
-    if (!dnsResult.anyDnsEntryAvailable) {
-      throw new Error('host unreachable via socks5: ' + dnsResult.host);
-    }
+    egressIpFamily = egress.egressIpFamily;
 
-    egressIpFamily = dnsResult.v6.isResolved ? 6 : 4;
-
-    log(`egressIpFamily: ${egressIpFamily}. host: ${dnsResult.host}`);
+    log(`egressIpFamily: ${egressIpFamily}. host: ${egress.host}`);
   }
 
   const args = getBrowserArgs({ egressIpFamily, useProxy });
@@ -799,7 +494,7 @@ const testRun2 = async () => {
   ];
 
   for (const i of toTest) {
-    log(await getDnsEntries(i));
+    log(await proxyFactory.getDnsEntries(i));
     log('-'.repeat(80));
   }
 };

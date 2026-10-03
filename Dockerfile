@@ -5,7 +5,8 @@ FROM mcr.microsoft.com/playwright:v1.62.1-noble
 ENV NODE_ENV=production
 # the browser factory picks a display per proxy, from :99 upwards
 ENV DISPLAY=:99
-# a fixed path outside /app, so that a bind mount cannot hide the binary
+# a named volume, so that a rebuild of the image keeps the 198 mb chromium.
+# docker-entrypoint.sh downloads it only when the volume is empty.
 ENV CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser
 
 # chromium shows a box glyph for each missing font, and that breaks the canvas
@@ -39,10 +40,6 @@ WORKDIR /app
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-
-# download the linux chromium of cloakbrowser at build time, so that the first
-# request does not wait for it
-RUN npx cloakbrowser install
 
 COPY . .
 

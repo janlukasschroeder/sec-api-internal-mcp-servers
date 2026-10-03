@@ -28,4 +28,12 @@ module.exports = {
     // the http endpoint of the server in docker, used by the stdio worker
     httpUrl: process.env.MCP_HTTP_URL || 'http://127.0.0.1:22001/mcp',
   },
+  // gluetun control server, one per proton container. used to cycle the vpn
+  // tunnel after youtube flags an egress ip, which hands the container a new
+  // exit node. host is the atlas tailscale ip, not loopback — the containers
+  // run on atlas and this code runs on beast.
+  gluetun: {
+    host: process.env.GLUETUN_HOST || 'http://100.124.201.21',
+    apiKey: process.env.GLUETUN_API_KEY || 'paste-a-random-uuid-here',
+  },
 };

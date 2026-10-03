@@ -17,8 +17,14 @@ services:
       # the key that secdotenv needs to decrypt .env
       - ~/.secdotenv:/root/.secdotenv:ro
       - ./output:/app/output
+      # the chromium of cloakbrowser, 198 mb. a named volume keeps it over a
+      # rebuild of the image.
+      - cloakbrowser:/opt/cloakbrowser
     # chromium needs more than the 64 mb default, or a tab dies on a big page
-    shm_size: '1gb'
+    shm_size: '4gb'
     # lets chromium open its own sandbox namespaces
     security_opt:
       - seccomp:unconfined
+
+volumes:
+  cloakbrowser:

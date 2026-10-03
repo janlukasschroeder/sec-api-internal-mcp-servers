@@ -37,4 +37,15 @@ fi
 
 echo "entrypoint: $(ls /tmp/.X11-unix | wc -l) displays ready" >&2
 
+CLOAKBROWSER_CLI=node_modules/cloakbrowser/dist/cli.js
+
+if node "$CLOAKBROWSER_CLI" info 2>/dev/null | grep -q 'Installed: true'; then
+  echo "entrypoint: cloak browser already in $CLOAKBROWSER_CACHE_DIR" >&2
+else
+  # a container that stops mid-download leaves its part file in the volume
+  rm -f "$CLOAKBROWSER_CACHE_DIR"/_download_*.tar.gz
+  echo "entrypoint: downloading the cloak browser once, 198 mb" >&2
+  node "$CLOAKBROWSER_CLI" install
+fi
+
 exec "$@"
