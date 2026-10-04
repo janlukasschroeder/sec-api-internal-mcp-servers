@@ -18,6 +18,17 @@ const RUNTIME_CACHE_DIR =
     ? '/dev/shm/sec-api-internal-mcp-servers/'
     : path.join(os.tmpdir(), 'sec-api-internal-mcp-servers/') + path.sep;
 const MAX_PAGES_PER_BROWSER = 20;
+const MAX_PAGE_ATTEMPTS = 3;
+
+// a fleet of browsers that all report the same window is a fingerprint of its
+// own, thus every browser takes a random width. the value stays out of the
+// args hash, or each call would launch a new browser.
+const MIN_WINDOW_WIDTH = 1020;
+const MAX_WINDOW_WIDTH = 1700;
+const WINDOW_HEIGHT = 900;
+// the window holds the tab strip and the address bar above the page, thus the
+// window is taller than the viewport
+const CHROME_UI_HEIGHT = 85;
 // on cap-hit, the browser is retired: cache slots are cleared immediately so
 // the next getBrowser() returns a fresh browser without waiting, then the old
 // browser is closed once its in-flight pages drain — or after this timeout,
@@ -176,6 +187,11 @@ const getBrowserArgs = ({
   return args;
 };
 
+const getRandomWindowWidth = () => {
+  const span = MAX_WINDOW_WIDTH - MIN_WINDOW_WIDTH + 1;
+  return MIN_WINDOW_WIDTH + Math.floor(Math.random() * span);
+};
+
 const getBrowserParams = ({ args, browserId }) => {
   const pid = String(process.pid);
   const dirName = pid + browserId;
@@ -186,11 +202,17 @@ const getBrowserParams = ({ args, browserId }) => {
     throw new Error('No args provided');
   }
 
+  const width = getRandomWindowWidth();
+
   // the cloak browser must run headed, or every bot wall sees it
   const browserParams = {
     headless: false,
     humanize: true,
-    args,
+    viewport: { width, height: WINDOW_HEIGHT },
+    args: [
+      ...args,
+      '--window-size=' + width + ',' + (WINDOW_HEIGHT + CHROME_UI_HEIGHT),
+    ],
     userDataDir,
   };
 
@@ -202,6 +224,8 @@ const getNewBrowser = async ({ args, browserId }) => {
   const launcher = store.launchers.cloakBrowser;
 
   const browserParams = getBrowserParams({ args, browserId });
+
+  log('launching a browser with width ' + browserParams.viewport.width);
 
   let browser;
 
@@ -374,6 +398,55 @@ const getBrowser = async ({
   }
 };
 module.exports.getBrowser = getBrowser;
+
+// launchPersistentContext comes up with an about:blank page already open, so
+// newPage() would always leave that idle tab behind. take over the blank page
+// when it is there, and open a new one only if it is not. pages() and the
+// _claimed flag are both synchronous, so two parallel requests can never claim
+// the same page.
+const claimPage = async (browser) => {
+  const openPages = typeof browser.pages === 'function' ? browser.pages() : [];
+
+  const blankPage = openPages.find(
+    (page) => !page.isClosed() && !page._claimed && page.url() === 'about:blank'
+  );
+
+  if (blankPage) {
+    blankPage._claimed = true;
+    return blankPage;
+  }
+
+  const page = await browser.newPage();
+  page._claimed = true;
+  return page;
+};
+
+// a browser can retire between getBrowser and the page: another call hits the
+// page cap, or chromium dies. the page would then open against a closing
+// context. take the next browser in that case, which getBrowser launches
+// because it skips a browser that closes.
+const getPage = async ({ useProxy, egressIpFamily, url } = {}) => {
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_PAGE_ATTEMPTS; attempt++) {
+    const browser = await getBrowser({ useProxy, egressIpFamily, url });
+
+    try {
+      return await claimPage(browser);
+    } catch (err) {
+      if (!/closed/i.test(err.message)) {
+        throw err;
+      }
+      lastError = err;
+      log(
+        `browser closed before the page, attempt ${attempt}/${MAX_PAGE_ATTEMPTS}`
+      );
+    }
+  }
+
+  throw lastError;
+};
+module.exports.getPage = getPage;
 
 const closeBrowserAndCleanUp = async () => {
   log('calling closeBrowserAndCleanUp');

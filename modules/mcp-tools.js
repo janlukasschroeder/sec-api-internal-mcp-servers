@@ -87,6 +87,12 @@ const SETTLE_TIMEOUT_MS = 5_000;
 const MAX_SCROLL_STEPS = 25;
 const SCROLL_WAIT_MS = 300;
 
+// jpeg, because a full page png of a long article runs into several mb, and
+// the answer carries the bytes as base64. the width comes from the browser,
+// which takes a random one per launch.
+const SCREENSHOT_TYPE = 'jpeg';
+const SCREENSHOT_QUALITY = 80;
+
 // -----------------------------
 // ScrapingBee
 // -----------------------------
@@ -124,28 +130,6 @@ module.exports.getWebsiteContent = getWebsiteContent;
 // -----------------------------
 // cloakbrowser
 // -----------------------------
-
-// launchPersistentContext comes up with an about:blank page already open, so
-// newPage() would always leave that idle tab behind. take over the blank page
-// when it is there, and open a new one only if it is not. pages() and the
-// _claimed flag are both synchronous, so two parallel requests can never claim
-// the same page.
-const getCloakPage = async (browser) => {
-  const openPages = typeof browser.pages === 'function' ? browser.pages() : [];
-
-  const blankPage = openPages.find(
-    (page) => !page.isClosed() && !page._claimed && page.url() === 'about:blank'
-  );
-
-  if (blankPage) {
-    blankPage._claimed = true;
-    return blankPage;
-  }
-
-  const page = await browser.newPage();
-  page._claimed = true;
-  return page;
-};
 
 // runs in the page. walks the light dom and all shadow roots, because consent
 // widgets are custom elements more often than not.
@@ -388,33 +372,34 @@ const gotoWithRetry = async ({ page, url, timeoutMs }) => {
   return null;
 };
 
+// load the page, clear the banner and scroll the lazy content into view. the
+// caller then reads the dom or takes a picture of it.
+const preparePage = async ({ page, url, timeoutMs, acceptCookies }) => {
+  await gotoWithRetry({ page, url, timeoutMs });
+
+  if (acceptCookies) {
+    const accepted = await acceptCookieBanner(page);
+
+    if (accepted) {
+      await page
+        .waitForLoadState('networkidle', { timeout: SETTLE_TIMEOUT_MS })
+        .catch(() => {});
+    }
+  }
+
+  await scrollToBottom(page);
+};
+
 const getWebsiteContentWithCloak = async ({
   url,
   timeoutMs = CLOAK_TIMEOUT_MS,
   useProxy = true,
   acceptCookies = true,
 }) => {
-  const browser = await browserFactory.getBrowser({
-    useProxy,
-    url,
-  });
-
-  const page = await getCloakPage(browser);
+  const page = await browserFactory.getPage({ useProxy, url });
 
   try {
-    await gotoWithRetry({ page, url, timeoutMs });
-
-    if (acceptCookies) {
-      const accepted = await acceptCookieBanner(page);
-
-      if (accepted) {
-        await page
-          .waitForLoadState('networkidle', { timeout: SETTLE_TIMEOUT_MS })
-          .catch(() => {});
-      }
-    }
-
-    await scrollToBottom(page);
+    await preparePage({ page, url, timeoutMs, acceptCookies });
 
     const html = await getFrameHtmlWithIframes({ frame: page.mainFrame() });
 
@@ -424,6 +409,31 @@ const getWebsiteContentWithCloak = async ({
   }
 };
 module.exports.getWebsiteContentWithCloak = getWebsiteContentWithCloak;
+
+const getWebsiteScreenshot = async ({
+  url,
+  timeoutMs = CLOAK_TIMEOUT_MS,
+  useProxy = true,
+  acceptCookies = true,
+  fullPage = true,
+}) => {
+  const page = await browserFactory.getPage({ useProxy, url });
+
+  try {
+    await preparePage({ page, url, timeoutMs, acceptCookies });
+
+    const buffer = await page.screenshot({
+      fullPage,
+      type: SCREENSHOT_TYPE,
+      quality: SCREENSHOT_QUALITY,
+    });
+
+    return { finalUrl: page.url(), buffer: Buffer.from(buffer) };
+  } finally {
+    await page.close().catch(() => {});
+  }
+};
+module.exports.getWebsiteScreenshot = getWebsiteScreenshot;
 
 // -----------------------------
 // pdf
@@ -483,8 +493,7 @@ const fetchAsBase64 = async (url) => {
 // a navigation to a pdf gives the html of the built-in viewer and not the file,
 // thus navigate first and fetch the bytes from inside the page afterwards.
 const getPdfWithBrowser = async ({ url, useProxy }) => {
-  const browser = await browserFactory.getBrowser({ useProxy, url });
-  const page = await getCloakPage(browser);
+  const page = await browserFactory.getPage({ useProxy, url });
 
   try {
     for (let attempt = 1; attempt <= MAX_GOTO_ATTEMPTS; attempt++) {
@@ -585,6 +594,14 @@ const writeCache = ({ url, html, text }) => {
 
 const writePdfCache = ({ url, buffer }) => {
   const filePath = getCachePath({ url, prefix: 'pdf' }) + '.pdf';
+
+  fs.writeFileSync(filePath, buffer);
+
+  return filePath;
+};
+
+const writeScreenshotCache = ({ url, buffer }) => {
+  const filePath = getCachePath({ url, prefix: 'screenshot' }) + '.jpg';
 
   fs.writeFileSync(filePath, buffer);
 
@@ -707,6 +724,64 @@ const getPdfHandler = async ({ pdfUrl, useProxy }) => {
   };
 };
 
+const getWebsiteAsImageHandler = async ({
+  websiteUrl,
+  timeoutMs,
+  useProxy,
+  fullPage,
+}) => {
+  log(`Taking a screenshot of: ${websiteUrl}`);
+
+  const { finalUrl, buffer } = await getWebsiteScreenshot({
+    url: websiteUrl,
+    timeoutMs,
+    useProxy,
+    fullPage,
+  });
+
+  const filePath = writeScreenshotCache({ url: websiteUrl, buffer });
+
+  log(`Shot ${finalUrl}. Bytes: ${buffer.length}. Cache: ${filePath}`);
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text:
+          'Screenshot of ' +
+          finalUrl +
+          ', ' +
+          Math.round(buffer.length / 1024) +
+          ' KB',
+      },
+      {
+        type: 'image',
+        data: buffer.toString('base64'),
+        mimeType: 'image/jpeg',
+      },
+    ],
+    structuredContent: {
+      url: finalUrl,
+      bytes: buffer.length,
+    },
+  };
+};
+
+const getWebsiteAsImageTool = {
+  name: 'get-website-as-image',
+  config: {
+    title: 'Get Website As Image',
+    description: `Fetch a website with a browser that runs JavaScript and return a screenshot of the page as a JPEG image. The browser clears the cookie banner and scrolls to the end first, thus the picture holds the lazy content as well. The width of the viewport is random, between 1020 and 1700 pixels. Set fullPage to false for the viewport alone. The request goes out over a rotating pool of Proton VPN exit nodes. Set useProxy to false to send it over the local IP instead. Use this tool to see a page, for a chart or a layout. Use get-website-as-text to read it.`,
+    inputSchema: z.object({
+      websiteUrl: z.string().url(),
+      timeoutMs: z.number().int().positive().optional(),
+      useProxy: z.boolean().optional(),
+      fullPage: z.boolean().optional(),
+    }),
+  },
+  handler: getWebsiteAsImageHandler,
+};
+
 const getPdfTool = {
   name: 'get-pdf',
   config: {
@@ -765,6 +840,7 @@ const tools = [
   // fetchWebsiteTool, // legacy
   getWebsiteAsHtmlTool,
   getWebsiteAsTextTool,
+  getWebsiteAsImageTool,
   getPdfTool,
 ];
 module.exports.tools = tools;
